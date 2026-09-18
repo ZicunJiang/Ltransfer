@@ -79,6 +79,7 @@
     let connected = false;
     let roomId = null;
     let peerConnected = false;
+    let activePairId = null;
 
     const rtcStatus = document.getElementById("rtc-status");
 
@@ -114,7 +115,7 @@
       } else if (!roomId) {
         peerStatus.textContent = "尚未配对";
       } else if (peerConnected) {
-        peerStatus.textContent = "对方已加入，可以发送消息";
+        peerStatus.textContent = "对方已加入";
       } else {
         peerStatus.textContent = "等待另一台设备加入";
       }
@@ -179,8 +180,13 @@
     }
 
     function sendSignal(signal) {
+      if (!activePairId) {
+        throw new Error("当前没有有效的配对");
+      }
+
       const success = send({
         type: "signal",
+        pairId: activePairId,
         signal,
       });
 
@@ -358,6 +364,7 @@
 
     function resetRTC() {
       rtcVersion += 1;
+      activePairId = null;
 
       const oldChannel = dataChannel;
       const oldConnection = pc;
@@ -409,13 +416,24 @@
           break;
 
         case "room-joined":
+          // 先清理上一轮状态，再保存新配对。
+          resetRTC();
+
           roomId = message.roomId;
           peerConnected = true;
+          activePairId = message.pairId;
+
           addLog(`已加入房间：${roomId}`);
           break;
 
         case "peer-joined":
+          // 必须先 reset，再设置 activePairId，
+          // 因为 resetRTC() 会清空配对标识。
+          resetRTC();
+
           peerConnected = true;
+          activePairId = message.pairId;
+
           addLog("另一台设备已加入，开始建立 WebRTC 连接。");
 
           enqueueRtcTask(startOffer);
@@ -442,11 +460,30 @@
           addLog("错误：" + message.message);
           break;
 
-        case "signal":
-          if (roomId && peerConnected) {
-            enqueueRtcTask(() => handleSignal(message.signal));
+        case "signal": {
+          if (
+            !roomId ||
+            !peerConnected ||
+            !activePairId ||
+            message.pairId !== activePairId
+          ) {
+            addLog("已忽略过期或不属于当前配对的信令。");
+            break;
           }
+
+          const receivedPairId = message.pairId;
+
+          enqueueRtcTask(async () => {
+            // 排队期间可能发生离开、重新配对，因此执行前再检查。
+            if (receivedPairId !== activePairId) {
+              return;
+            }
+
+            await handleSignal(message.signal);
+          });
+
           break;
+        }
 
         default:
           addLog("收到未知消息类型：" + message.type);

@@ -1,7 +1,7 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const { randomInt } = require("node:crypto");
+const { randomInt, randomUUID } = require("node:crypto");
 const { WebSocketServer, WebSocket } = require("ws");
 
 // 房间码 -> 房间成员集合。
@@ -9,6 +9,9 @@ const rooms = new Map();
 
 // WebSocket 连接 -> 会话信息。
 const sessions = new Map();
+// 房间码 -> 当前双人配对的标识。
+// 房间只有一名成员时，不保留配对标识。
+const pairIds = new Map();
 
 const page = fs.readFileSync(path.join(__dirname, "test.html"));
 
@@ -72,6 +75,9 @@ function leaveRoom(socket, notifySelf = true) {
 
   const roomId = session.roomId;
   const room = rooms.get(roomId);
+  // 立即废弃上一轮配对。
+  // 即使旧成员的信令稍后到达，也不能继续转发。
+  pairIds.delete(roomId);
 
   // 保留 WebSocket 会话，但清除房间归属。
   session.roomId = null;
@@ -166,22 +172,29 @@ function handleMessage(socket, message) {
       room.add(socket);
       session.roomId = roomId;
 
+      // 每次有第二名成员加入，都建立一轮新的配对。
+      const pairId = randomUUID();
+      pairIds.set(roomId, pairId);
+
+      // 通知新加入的成员。
       send(socket, {
         type: "room-joined",
         roomId,
+        pairId,
       });
 
-      // 通知原来已经在房间里的成员。
+      // 通知已经在房间里的成员。
       for (const peer of room) {
         if (peer !== socket) {
           send(peer, {
             type: "peer-joined",
             roomId,
+            pairId,
           });
         }
       }
 
-      console.log(`成员加入房间：${roomId}`);
+      console.log(`成员加入房间：${roomId}，配对：${pairId}`);
       break;
     }
 
@@ -238,6 +251,18 @@ function handleMessage(socket, message) {
         return;
       }
 
+      const currentPairId = pairIds.get(session.roomId);
+
+      if (
+        !currentPairId ||
+        typeof message.pairId !== "string" ||
+        message.pairId !== currentPairId
+      ) {
+        // 旧信令在离开、重新配对时可能正常出现，直接丢弃。
+        console.log("已丢弃过期或缺少配对标识的信令");
+        return;
+      }
+
       const signal = message.signal;
 
       if (
@@ -287,6 +312,7 @@ function handleMessage(socket, message) {
 
       send(peer, {
         type: "signal",
+        pairId: currentPairId,
         signal,
       });
 
