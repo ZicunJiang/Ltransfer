@@ -232,6 +232,68 @@ function handleMessage(socket, message) {
       break;
     }
 
+    case "signal": {
+      if (!session.roomId) {
+        sendError(socket, "请先加入房间。");
+        return;
+      }
+
+      const signal = message.signal;
+
+      if (
+        !signal ||
+        typeof signal !== "object" ||
+        !["offer", "answer", "candidate"].includes(signal.kind)
+      ) {
+        sendError(socket, "无效的 WebRTC 信令。");
+        return;
+      }
+
+      if (
+        ["offer", "answer"].includes(signal.kind) &&
+        (
+          !signal.description ||
+          signal.description.type !== signal.kind ||
+          typeof signal.description.sdp !== "string"
+        )
+      ) {
+        sendError(socket, "无效的连接描述。");
+        return;
+      }
+
+      if (
+        signal.kind === "candidate" &&
+        (
+          !signal.candidate ||
+          typeof signal.candidate.candidate !== "string"
+        )
+      ) {
+        sendError(socket, "无效的 ICE Candidate。");
+        return;
+      }
+
+      const room = rooms.get(session.roomId);
+
+      const peer = room && [...room].find(
+        (member) =>
+          member !== socket &&
+          member.readyState === WebSocket.OPEN
+      );
+
+      if (!peer) {
+        sendError(socket, "对方不在线，无法转发信令。");
+        return;
+      }
+
+      send(peer, {
+        type: "signal",
+        signal,
+      });
+
+      console.log(`已转发信令：${signal.kind}`);
+      break;
+    }
+
     default: {
       sendError(socket, "不支持的消息类型。");
     }

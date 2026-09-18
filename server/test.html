@@ -11,6 +11,10 @@
   <p id="connection-status">正在连接服务器……</p>
   <p>当前房间：<strong id="current-room">未加入</strong></p>
   <p id="peer-status">尚未配对</p>
+  <p>
+    WebRTC：
+    <strong id="rtc-status">尚未建立连接</strong>
+  </p>
 
   <div>
     <button id="create-room" disabled>创建房间</button>
@@ -76,6 +80,20 @@
     let roomId = null;
     let peerConnected = false;
 
+    const rtcStatus = document.getElementById("rtc-status");
+
+    let pc = null;
+    let dataChannel = null;
+
+    // 远端连接描述尚未设置时，暂存收到的候选。
+    let pendingCandidates = [];
+
+    // 按顺序处理异步信令。
+    let signalQueue = Promise.resolve();
+
+    // 清理连接时递增，用来忽略旧连接的待处理任务。
+    let rtcVersion = 0;
+
     const wsProtocol =
       location.protocol === "https:" ? "wss:" : "ws:";
 
@@ -107,7 +125,12 @@
 
       leaveButton.disabled = !connected || !roomId;
 
-      const canSend = connected && Boolean(roomId) && peerConnected;
+      const canSend =
+        connected &&
+        Boolean(roomId) &&
+        peerConnected &&
+        pc?.connectionState === "connected" &&
+        dataChannel?.readyState === "open";
 
       messageInput.disabled = !canSend;
       sendButton.disabled = !canSend;
@@ -121,6 +144,239 @@
 
       socket.send(JSON.stringify(message));
       return true;
+    }
+
+    function bindDataChannel(channel) {
+      dataChannel = channel;
+
+      channel.onopen = () => {
+        if (dataChannel !== channel) return;
+
+        rtcStatus.textContent = "DataChannel 已连接";
+        addLog("WebRTC 数据通道已打开。");
+        updateUI();
+      };
+
+      channel.onmessage = (event) => {
+        if (dataChannel !== channel) return;
+
+        addLog("对方（WebRTC）：" + event.data);
+      };
+
+      channel.onclose = () => {
+        if (dataChannel !== channel) return;
+
+        rtcStatus.textContent = "DataChannel 已关闭";
+        addLog("WebRTC 数据通道已关闭。");
+        updateUI();
+      };
+
+      channel.onerror = () => {
+        if (dataChannel !== channel) return;
+
+        addLog("WebRTC 数据通道发生错误。");
+      };
+    }
+
+    function sendSignal(signal) {
+      const success = send({
+        type: "signal",
+        signal,
+      });
+
+      if (!success) {
+        throw new Error("信令服务器连接不可用");
+      }
+    }
+
+    function ensurePeerConnection() {
+      if (pc) {
+        return pc;
+      }
+
+      const connection = new RTCPeerConnection({
+        iceServers: [],
+      });
+
+      pc = connection;
+      rtcStatus.textContent = "正在协商连接";
+
+      connection.onicecandidate = (event) => {
+        if (pc !== connection) return;
+
+        if (event.candidate) {
+          try {
+            sendSignal({
+              kind: "candidate",
+              candidate: event.candidate.toJSON(),
+            });
+          } catch (error) {
+            addLog("候选发送失败：" + error.message);
+          }
+        }
+      };
+
+      // 接收方通过这个事件获得发起方创建的数据通道。
+      connection.ondatachannel = (event) => {
+        if (pc !== connection) return;
+
+        bindDataChannel(event.channel);
+      };
+
+      connection.onconnectionstatechange = () => {
+        if (pc !== connection) return;
+
+        const state = connection.connectionState;
+        addLog("WebRTC 连接状态：" + state);
+
+        if (state === "failed") {
+          rtcStatus.textContent = "连接失败，请离开房间后重新加入";
+        } else if (state === "disconnected") {
+          rtcStatus.textContent = "连接暂时中断";
+        } else if (
+          state === "connected" &&
+          dataChannel?.readyState === "open"
+        ) {
+          rtcStatus.textContent = "DataChannel 已连接";
+        }
+
+        updateUI();
+      };
+
+      return connection;
+    }
+
+    async function startOffer() {
+      const connection = ensurePeerConnection();
+
+      // 只有发起方主动创建通道。
+      bindDataChannel(
+        connection.createDataChannel("text")
+      );
+
+      const offer = await connection.createOffer();
+
+      if (pc !== connection) return;
+
+      await connection.setLocalDescription(offer);
+
+      if (pc !== connection) return;
+
+      sendSignal({
+        kind: "offer",
+        description: connection.localDescription.toJSON(),
+      });
+
+      addLog("已发送 Offer。");
+    }
+
+    async function applyRemoteDescription(connection, description) {
+      await connection.setRemoteDescription(description);
+
+      if (pc !== connection) return;
+
+      while (pendingCandidates.length > 0) {
+        const candidate = pendingCandidates.shift();
+
+        await connection.addIceCandidate(candidate);
+
+        if (pc !== connection) return;
+      }
+    }
+
+    async function handleSignal(signal) {
+      const connection = ensurePeerConnection();
+
+      switch (signal.kind) {
+        case "offer": {
+          addLog("收到 Offer。");
+
+          await applyRemoteDescription(
+            connection,
+            signal.description
+          );
+
+          if (pc !== connection) return;
+
+          const answer = await connection.createAnswer();
+
+          if (pc !== connection) return;
+
+          await connection.setLocalDescription(answer);
+
+          if (pc !== connection) return;
+
+          sendSignal({
+            kind: "answer",
+            description: connection.localDescription.toJSON(),
+          });
+
+          addLog("已发送 Answer。");
+          break;
+        }
+
+        case "answer": {
+          await applyRemoteDescription(
+            connection,
+            signal.description
+          );
+
+          if (pc !== connection) return;
+
+          addLog("收到并设置 Answer。");
+          break;
+        }
+
+        case "candidate": {
+          if (connection.remoteDescription) {
+            await connection.addIceCandidate(signal.candidate);
+          } else {
+            pendingCandidates.push(signal.candidate);
+          }
+
+          break;
+        }
+      }
+    }
+
+    function enqueueRtcTask(task) {
+      const version = rtcVersion;
+
+      signalQueue = signalQueue
+        .then(async () => {
+          if (version !== rtcVersion) return;
+
+          await task();
+        })
+        .catch((error) => {
+          if (version !== rtcVersion) return;
+
+          rtcStatus.textContent = "协商失败，请离开房间后重新加入";
+          addLog("WebRTC 错误：" + error.message);
+        });
+    }
+
+    function resetRTC() {
+      rtcVersion += 1;
+
+      const oldChannel = dataChannel;
+      const oldConnection = pc;
+
+      dataChannel = null;
+      pc = null;
+      pendingCandidates = [];
+      signalQueue = Promise.resolve();
+
+      if (oldChannel) {
+        oldChannel.close();
+      }
+
+      if (oldConnection) {
+        oldConnection.close();
+      }
+
+      rtcStatus.textContent = "尚未建立连接";
+      updateUI();
     }
 
     socket.addEventListener("open", () => {
@@ -160,17 +416,21 @@
 
         case "peer-joined":
           peerConnected = true;
-          addLog("另一台设备已加入。");
+          addLog("另一台设备已加入，开始建立 WebRTC 连接。");
+
+          enqueueRtcTask(startOffer);
           break;
 
         case "peer-left":
           peerConnected = false;
-          addLog("对方已离开，房间保留，可以等待新设备加入。");
+          resetRTC();
+          addLog("对方已离开，等待新设备加入。");
           break;
 
         case "room-left":
           roomId = null;
           peerConnected = false;
+          resetRTC();
           addLog("你已离开房间。");
           break;
 
@@ -180,6 +440,12 @@
 
         case "error":
           addLog("错误：" + message.message);
+          break;
+
+        case "signal":
+          if (roomId && peerConnected) {
+            enqueueRtcTask(() => handleSignal(message.signal));
+          }
           break;
 
         default:
@@ -194,9 +460,12 @@
       roomId = null;
       peerConnected = false;
 
-      connectionStatus.textContent = "服务器已断开，请刷新页面重连";
-      addLog("服务器连接已断开。");
+      resetRTC();
 
+      connectionStatus.textContent =
+        "服务器已断开，请刷新页面重连";
+
+      addLog("服务器连接已断开。");
       updateUI();
     });
 
@@ -237,17 +506,23 @@
 
       const text = messageInput.value.trim();
 
-      if (!text || !roomId || !peerConnected) {
+      if (!text) return;
+
+      if (
+        pc?.connectionState !== "connected" ||
+        dataChannel?.readyState !== "open"
+      ) {
+        addLog("数据通道尚未连接。");
         return;
       }
 
-      if (send({
-        type: "relay",
-        text,
-      })) {
-        // 这里只确认交给 WebSocket 发送，不代表对方已收到。
-        addLog("我（已提交发送）：" + text);
+      try {
+        dataChannel.send(text);
+
+        addLog("我（WebRTC 已提交发送）：" + text);
         messageInput.value = "";
+      } catch (error) {
+        addLog("发送失败：" + error.message);
       }
     });
 
