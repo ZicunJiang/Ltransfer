@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文件传输工程：通信测试</title>
+</head>
+<body>
+  <h1>WebSocket 通信测试</h1>
+
+  <p id="status">正在连接服务器……</p>
+
+  <form id="message-form">
+    <input
+      id="message"
+      placeholder="请输入消息"
+      maxlength="1000"
+      autocomplete="off"
+    >
+    <button id="send" type="submit" disabled>发送</button>
+  </form>
+
+  <pre id="log"></pre>
+
+  <script>
+    const status = document.getElementById("status");
+    const form = document.getElementById("message-form");
+    const input = document.getElementById("message");
+    const button = document.getElementById("send");
+    const log = document.getElementById("log");
+
+    function addLog(text) {
+      log.textContent += text + "\n";
+    }
+
+    // 连接到提供当前页面的服务器。
+    const socket = new WebSocket(`ws://${location.host}/ws`);
+
+    socket.addEventListener("open", () => {
+      status.textContent = "已连接";
+      button.disabled = false;
+    });
+
+    socket.addEventListener("message", (event) => {
+      addLog("收到：" + event.data);
+    });
+
+    socket.addEventListener("close", () => {
+      status.textContent = "连接已断开，重启服务器后请刷新页面";
+      button.disabled = true;
+    });
+
+    socket.addEventListener("error", () => {
+      addLog("连接发生错误，请检查服务器是否正在运行。");
+    });
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+
+      const text = input.value.trim();
+
+      if (!text || socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      socket.send(text);
+      addLog("发送：" + text);
+      input.value = "";
+    });
+  </script>
+</body>
+</html>
