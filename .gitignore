@@ -11,3 +11,6 @@ node_modules/
 
 # 日志文件
 *.log
+
+#环境配置脚本
+.start.sh

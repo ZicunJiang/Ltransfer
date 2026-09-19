@@ -55,6 +55,33 @@
     </button>
   </form>
 
+<hr>
+
+<section>
+  <h2>文件传输</h2>
+
+  <input id="file-input" type="file" disabled>
+  <button id="send-file" type="button" disabled>发送文件</button>
+
+  <p>首版支持单文件传输，最大 100 MiB。</p>
+  <p id="file-status">请选择文件</p>
+
+  <p>
+    发送：
+    <progress id="send-progress" max="100" value="0"></progress>
+    <span id="send-percent">0%</span>
+  </p>
+
+  <p>
+    接收：
+    <progress id="receive-progress" max="100" value="0"></progress>
+    <span id="receive-percent">0%</span>
+  </p>
+
+  <a id="download-file" hidden>下载收到的文件</a>
+</section>
+
+
   <pre id="log"></pre>
 
   <script>
@@ -102,6 +129,531 @@
       `${wsProtocol}//${location.host}/ws`
     );
 
+    // ---------- 文件传输配置 ----------
+
+    const MAX_FILE_SIZE = 100 * 1024 * 1024;
+    const DEFAULT_CHUNK_SIZE = 16 * 1024;
+
+    const BUFFER_HIGH = 1024 * 1024;
+    const BUFFER_LOW = 256 * 1024;
+
+    // 等待准备、缓冲排空、完成确认的最长时间。
+    const TRANSFER_TIMEOUT = 60_000;
+
+    // ---------- 文件传输界面 ----------
+
+    const fileInput = document.getElementById("file-input");
+    const sendFileButton = document.getElementById("send-file");
+    const fileStatus = document.getElementById("file-status");
+
+    const sendProgress = document.getElementById("send-progress");
+    const sendPercent = document.getElementById("send-percent");
+
+    const receiveProgress = document.getElementById("receive-progress");
+    const receivePercent = document.getElementById("receive-percent");
+
+    const downloadFile = document.getElementById("download-file");
+
+    // 一个连接同一时间只处理一个文件任务。
+    let fileTask = null;
+    let transferSequence = 0;
+    let downloadUrl = null;
+
+    function updateFileUI() {
+      const available =
+        connected &&
+        peerConnected &&
+        Boolean(activePairId) &&
+        pc?.connectionState === "connected" &&
+        dataChannel?.readyState === "open";
+
+      fileInput.disabled = !available || Boolean(fileTask);
+
+      sendFileButton.disabled =
+        !available ||
+        Boolean(fileTask) ||
+        !fileInput.files?.length;
+    }
+
+    function setFileProgress(direction, bytes, total) {
+      // 空文件在确认完成时也应显示 100%。
+      const value = total === 0
+        ? 100
+        : Math.min(100, bytes / total * 100);
+
+      const progress = direction === "send"
+        ? sendProgress
+        : receiveProgress;
+
+      const label = direction === "send"
+        ? sendPercent
+        : receivePercent;
+
+      progress.value = value;
+      label.textContent = `${value.toFixed(1)}%`;
+    }
+
+    function clearDownload() {
+      if (downloadUrl) {
+        URL.revokeObjectURL(downloadUrl);
+        downloadUrl = null;
+      }
+
+      downloadFile.hidden = true;
+      downloadFile.removeAttribute("href");
+      downloadFile.removeAttribute("download");
+    }
+
+    // 控制消息也通过 DataChannel 发送。
+    function sendFileControl(channel, message) {
+      if (
+        channel !== dataChannel ||
+        channel.readyState !== "open"
+      ) {
+        throw new Error("数据通道不可用");
+      }
+
+      channel.send(JSON.stringify(message));
+    }
+
+    // 检查异步任务是否仍属于当前配对和当前通道。
+    function isCurrentFileTask(task) {
+      return (
+        fileTask === task &&
+        task.channel === dataChannel &&
+        task.channel.readyState === "open" &&
+        task.pairId === activePairId &&
+        task.version === rtcVersion
+      );
+    }
+
+    function finishFileTask(task) {
+      if (fileTask !== task) return;
+
+      clearTimeout(task.timer);
+
+      if (task.chunks) {
+        task.chunks.length = 0;
+      }
+
+      fileTask = null;
+      updateFileUI();
+    }
+
+    function failFileTask(task, reason, notifyPeer = true) {
+      if (fileTask !== task) return;
+
+      if (notifyPeer && isCurrentFileTask(task)) {
+        try {
+          sendFileControl(task.channel, {
+            type: "file-error",
+            transferId: task.id,
+            message: reason,
+          });
+        } catch {
+          // 通道已关闭时，本地清理仍然需要执行。
+        }
+      }
+
+      finishFileTask(task);
+      fileStatus.textContent = `传输失败：${reason}`;
+      addLog(`文件传输失败：${reason}`);
+    }
+
+    // 被 resetRTC()、通道关闭和错误处理调用。
+    function resetFileTransfer(reason = "文件传输状态已重置") {
+      if (fileTask) {
+        failFileTask(fileTask, reason, false);
+      }
+
+      clearDownload();
+
+      sendProgress.value = 0;
+      sendPercent.textContent = "0%";
+      receiveProgress.value = 0;
+      receivePercent.textContent = "0%";
+
+      fileStatus.textContent = reason;
+      updateFileUI();
+    }
+
+    // 可取消的条件等待。
+    // 定时检查可以同时响应缓冲区变化、任务取消和通道关闭。
+    async function waitForFileCondition(task, condition) {
+      const deadline = Date.now() + TRANSFER_TIMEOUT;
+
+      while (true) {
+        if (!isCurrentFileTask(task)) {
+          throw new Error("连接或传输任务已失效");
+        }
+
+        if (condition()) return;
+
+        if (Date.now() >= deadline) {
+          throw new Error("等待对方或发送缓冲区超时");
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+
+    // 接收端长时间没有收到数据时，释放任务。
+    function refreshReceiveTimeout(task) {
+      clearTimeout(task.timer);
+
+      task.timer = setTimeout(() => {
+        failFileTask(task, "接收数据超时");
+      }, TRANSFER_TIMEOUT);
+    }
+
+    // ---------- 发送文件 ----------
+
+    async function sendSelectedFile() {
+      const file = fileInput.files?.[0];
+      const channel = dataChannel;
+
+      if (!file || fileTask) return;
+
+      if (
+        !activePairId ||
+        pc?.connectionState !== "connected" ||
+        channel?.readyState !== "open"
+      ) {
+        fileStatus.textContent = "请先建立 WebRTC 连接";
+        return;
+      }
+
+      if (file.size > MAX_FILE_SIZE) {
+        fileStatus.textContent = "文件不能超过 100 MiB";
+        return;
+      }
+
+      // room 创建方和加入方可能同时点击发送。
+      // 加上角色，避免同一配对中双方生成相同的任务 ID。
+      const role = pc.localDescription?.type === "offer"
+        ? "offerer"
+        : "answerer";
+
+      const task = {
+        id: `${activePairId}:${role}:${++transferSequence}`,
+        direction: "send",
+        pairId: activePairId,
+        version: rtcVersion,
+        channel,
+        phase: "waiting-ready",
+        bytes: 0,
+        size: file.size,
+      };
+
+      fileTask = task;
+      sendProgress.value = 0;
+      sendPercent.textContent = "0%";
+      fileStatus.textContent = `等待对方接收：${file.name}`;
+      updateFileUI();
+
+      try {
+        sendFileControl(channel, {
+          type: "file-meta",
+          transferId: task.id,
+          name: file.name,
+          size: file.size,
+          mime: file.type,
+        });
+
+        await waitForFileCondition(
+          task,
+          () => task.phase === "sending"
+        );
+
+        // 未提供上限或上限为 0 时，使用保守的 16 KiB。
+        const negotiatedLimit = pc?.sctp?.maxMessageSize;
+
+        const chunkSize =
+          Number.isFinite(negotiatedLimit) && negotiatedLimit > 0
+            ? Math.min(DEFAULT_CHUNK_SIZE, negotiatedLimit)
+            : DEFAULT_CHUNK_SIZE;
+
+        while (task.bytes < file.size) {
+          if (!isCurrentFileTask(task)) {
+            throw new Error("传输任务已失效");
+          }
+
+          // 缓冲区达到高水位后，等待降至低水位。
+          if (channel.bufferedAmount >= BUFFER_HIGH) {
+            await waitForFileCondition(
+              task,
+              () => channel.bufferedAmount <= BUFFER_LOW
+            );
+          }
+
+          const end = Math.min(
+            task.bytes + chunkSize,
+            file.size
+          );
+
+          const chunk = await file
+            .slice(task.bytes, end)
+            .arrayBuffer();
+
+          // 读取文件期间可能发生离开房间或重新配对。
+          if (!isCurrentFileTask(task)) {
+            throw new Error("读取期间连接已失效");
+          }
+
+          channel.send(chunk);
+          task.bytes = end;
+
+          setFileProgress("send", task.bytes, file.size);
+
+          fileStatus.textContent =
+            `正在发送：${file.name} ` +
+            `(${task.bytes} / ${file.size} 字节)`;
+        }
+
+        // 先等待发送队列排空，再提交结束标记。
+        await waitForFileCondition(
+          task,
+          () => channel.bufferedAmount === 0
+        );
+
+        task.phase = "waiting-complete";
+
+        sendFileControl(channel, {
+          type: "file-end",
+          transferId: task.id,
+        });
+
+        fileStatus.textContent = "数据已提交，等待对方确认";
+
+        await waitForFileCondition(
+          task,
+          () => task.phase === "complete"
+        );
+
+        setFileProgress("send", file.size, file.size);
+        finishFileTask(task);
+
+        fileStatus.textContent = `对方已完整接收：${file.name}`;
+        addLog(`文件发送完成：${file.name}`);
+      } catch (error) {
+        // 已被清理的旧任务不会影响新任务。
+        failFileTask(task, error.message);
+      }
+    }
+
+    // ---------- 接收元信息 ----------
+
+    function receiveFileMeta(message, channel) {
+      const valid =
+        typeof message.transferId === "string" &&
+        message.transferId.length > 0 &&
+        message.transferId.length <= 200 &&
+        typeof message.name === "string" &&
+        message.name.length > 0 &&
+        message.name.length <= 1024 &&
+        Number.isSafeInteger(message.size) &&
+        message.size >= 0 &&
+        message.size <= MAX_FILE_SIZE &&
+        typeof message.mime === "string" &&
+        message.mime.length <= 255;
+
+      if (!valid || fileTask) {
+        sendFileControl(channel, {
+          type: "file-error",
+          transferId: message.transferId,
+          message: fileTask
+            ? "当前正在处理其他文件，请稍后重试"
+            : "文件信息无效或文件超过 100 MiB",
+        });
+        return;
+      }
+
+      clearDownload();
+
+      const task = {
+        id: message.transferId,
+        direction: "receive",
+        pairId: activePairId,
+        version: rtcVersion,
+        channel,
+        name: message.name,
+        size: message.size,
+        mime: message.mime,
+        bytes: 0,
+        chunks: [],
+        timer: null,
+      };
+
+      fileTask = task;
+
+      receiveProgress.value = 0;
+      receivePercent.textContent = "0%";
+
+      fileStatus.textContent = `准备接收：${task.name}`;
+      updateFileUI();
+
+      refreshReceiveTimeout(task);
+
+      sendFileControl(channel, {
+        type: "file-ready",
+        transferId: task.id,
+      });
+    }
+
+    // ---------- 接收二进制块 ----------
+
+    function receiveFileChunk(chunk) {
+      const task = fileTask;
+
+      if (
+        !task ||
+        task.direction !== "receive" ||
+        !isCurrentFileTask(task)
+      ) {
+        return;
+      }
+
+      if (
+        chunk.byteLength === 0 ||
+        task.bytes + chunk.byteLength > task.size
+      ) {
+        failFileTask(task, "收到的文件数据大小异常");
+        return;
+      }
+
+      task.chunks.push(chunk);
+      task.bytes += chunk.byteLength;
+
+      refreshReceiveTimeout(task);
+      setFileProgress("receive", task.bytes, task.size);
+
+      fileStatus.textContent =
+        `正在接收：${task.name} ` +
+        `(${task.bytes} / ${task.size} 字节)`;
+    }
+
+    // ---------- 接收结束标记 ----------
+
+    function completeReceivedFile(task) {
+      if (task.bytes !== task.size) {
+        failFileTask(task, "接收到的字节数与文件大小不一致");
+        return;
+      }
+
+      const blob = new Blob(task.chunks, {
+        type: task.mime || "application/octet-stream",
+      });
+
+      clearDownload();
+      downloadUrl = URL.createObjectURL(blob);
+
+      downloadFile.href = downloadUrl;
+      downloadFile.download = task.name;
+      downloadFile.textContent = `下载：${task.name}`;
+      downloadFile.hidden = false;
+
+      sendFileControl(task.channel, {
+        type: "file-complete",
+        transferId: task.id,
+      });
+
+      setFileProgress("receive", task.size, task.size);
+      finishFileTask(task);
+
+      fileStatus.textContent = `接收完成：${task.name}`;
+      addLog(`文件接收完成：${task.name}`);
+    }
+
+    // ---------- DataChannel 消息分发 ----------
+
+    function handleDataChannelMessage(data, channel) {
+      if (data instanceof ArrayBuffer) {
+        receiveFileChunk(data);
+        return;
+      }
+
+      if (typeof data !== "string") return;
+
+      let message;
+
+      try {
+        message = JSON.parse(data);
+      } catch {
+        // 兼容之前直接发送的普通文本。
+        addLog("对方（WebRTC）：" + data);
+        return;
+      }
+
+      if (
+        !message ||
+        typeof message !== "object" ||
+        Array.isArray(message)
+      ) {
+        return;
+      }
+
+      if (message.type === "chat") {
+        if (typeof message.text === "string") {
+          addLog("对方（WebRTC）：" + message.text);
+        }
+        return;
+      }
+
+      if (message.type === "file-meta") {
+        receiveFileMeta(message, channel);
+        return;
+      }
+
+      const task = fileTask;
+
+      if (
+        !task ||
+        !isCurrentFileTask(task) ||
+        message.transferId !== task.id
+      ) {
+        return;
+      }
+
+      switch (message.type) {
+        case "file-ready":
+          if (
+            task.direction === "send" &&
+            task.phase === "waiting-ready"
+          ) {
+            task.phase = "sending";
+          }
+          break;
+
+        case "file-end":
+          if (task.direction === "receive") {
+            completeReceivedFile(task);
+          }
+          break;
+
+        case "file-complete":
+          if (
+            task.direction === "send" &&
+            task.phase === "waiting-complete"
+          ) {
+            task.phase = "complete";
+          }
+          break;
+
+        case "file-error":
+          failFileTask(
+            task,
+            typeof message.message === "string"
+              ? message.message
+              : "对方终止了传输",
+            false
+          );
+          break;
+      }
+    }
+
+    fileInput.addEventListener("change", updateFileUI);
+    sendFileButton.addEventListener("click", sendSelectedFile);
+
     function addLog(text) {
       // 使用 textContent，消息会作为文字显示。
       log.textContent += text + "\n";
@@ -135,6 +687,8 @@
 
       messageInput.disabled = !canSend;
       sendButton.disabled = !canSend;
+      
+      updateFileUI();
     }
 
     function send(message) {
@@ -150,6 +704,9 @@
     function bindDataChannel(channel) {
       dataChannel = channel;
 
+      // 二进制消息直接作为 ArrayBuffer 接收。
+      channel.binaryType = "arraybuffer";
+
       channel.onopen = () => {
         if (dataChannel !== channel) return;
 
@@ -161,11 +718,21 @@
       channel.onmessage = (event) => {
         if (dataChannel !== channel) return;
 
-        addLog("对方（WebRTC）：" + event.data);
+        try {
+          handleDataChannelMessage(event.data, channel);
+        } catch (error) {
+          if (fileTask) {
+            failFileTask(fileTask, error.message);
+          } else {
+            addLog("数据处理失败：" + error.message);
+          }
+        }
       };
 
       channel.onclose = () => {
         if (dataChannel !== channel) return;
+
+        resetFileTransfer("数据通道已关闭");
 
         rtcStatus.textContent = "DataChannel 已关闭";
         addLog("WebRTC 数据通道已关闭。");
@@ -175,7 +742,9 @@
       channel.onerror = () => {
         if (dataChannel !== channel) return;
 
+        resetFileTransfer("数据通道发生错误");
         addLog("WebRTC 数据通道发生错误。");
+        updateUI();
       };
     }
 
@@ -363,6 +932,8 @@
     }
 
     function resetRTC() {
+      resetFileTransfer("连接已重置，请重新选择或发送文件");
+      
       rtcVersion += 1;
       activePairId = null;
 
@@ -554,7 +1125,10 @@
       }
 
       try {
-        dataChannel.send(text);
+        dataChannel.send(JSON.stringify({
+          type: "chat",
+          text,
+        }));
 
         addLog("我（WebRTC 已提交发送）：" + text);
         messageInput.value = "";
